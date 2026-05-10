@@ -17,7 +17,7 @@ use super::committer::reader::ParsedCommitment;
 use super::utils::get_challenge_stir_queries;
 use crate::alloc::string::ToString;
 use crate::constraints::Constraint;
-use crate::constraints::statement::{EqStatement, SelectStatement};
+use crate::constraints::statement::SelectStatement;
 use crate::parameters::{RoundConfig, WhirConfig};
 use crate::pcs::proof::{QueryOpening, WhirProof};
 use crate::sumcheck::strategy::VariableOrder;
@@ -25,24 +25,63 @@ use crate::sumcheck::verify_final_sumcheck_rounds;
 
 pub mod errors;
 
-/// WHIR protocol verifier.
+/// Replays a WHIR opening proof against a public commitment and the
+/// constraint built by the layout adapter.
+///
+/// # Borrowing
+///
+/// - Config and Merkle scheme are borrowed for the lifetime of the check.
+/// - Nothing is cloned across `verify`.
+/// - Construction is `const`; spinning up a fresh verifier per proof is free.
+///
+/// # Variable order
+///
+/// Tag declared by the prover at commit time. Selects which way folding
+/// randomness is consumed in the final identity and STIR unfold:
+///
+/// ```text
+///     Prefix:  fold(rs)         -> final eval, query unfold
+///     Suffix:  fold(rs.rev())   -> same checks, reversed binding
+/// ```
 #[derive(Debug)]
-pub struct WhirVerifier<'a, EF, F, MT, Challenger>(
-    pub(crate) &'a WhirConfig<EF, F, MT, Challenger>,
-)
+pub struct WhirVerifier<'a, EF, F, MT, Challenger>
 where
     F: Field,
-    EF: ExtensionField<F>;
+    EF: ExtensionField<F>,
+    MT: Mmcs<F>,
+{
+    /// Derived per-protocol parameters and per-round configuration.
+    pub(crate) config: &'a WhirConfig<EF, F, Challenger>,
+    /// Base-field Merkle commitment scheme used to authenticate STIR queries.
+    pub(crate) mmcs: &'a MT,
+    /// Binding direction used to interpret folding randomness.
+    pub(crate) variable_order: VariableOrder,
+}
 
 impl<'a, EF, F, MT, Challenger> WhirVerifier<'a, EF, F, MT, Challenger>
 where
     F: TwoAdicField,
     EF: ExtensionField<F> + TwoAdicField,
-    Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F> + CanSampleUniformBits<F>,
     MT: Mmcs<F>,
+    Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F> + CanSampleUniformBits<F>,
 {
-    pub const fn new(params: &'a WhirConfig<EF, F, MT, Challenger>) -> Self {
-        Self(params)
+    /// Wraps the verifier-side dependencies into a single replay context.
+    ///
+    /// # Arguments
+    ///
+    /// - `config`         — derived per-protocol parameters and per-round configuration.
+    /// - `mmcs`           — base-field Merkle commitment scheme used to authenticate STIR queries.
+    /// - `variable_order` — binding direction the prover declared at commit time.
+    pub const fn new(
+        config: &'a WhirConfig<EF, F, Challenger>,
+        mmcs: &'a MT,
+        variable_order: VariableOrder,
+    ) -> Self {
+        Self {
+            config,
+            mmcs,
+            variable_order,
+        }
     }
 
     /// Verify a WHIR proof against a commitment and statement.
@@ -54,27 +93,18 @@ where
         &self,
         proof: &WhirProof<F, EF, MT>,
         challenger: &mut Challenger,
-        parsed_commitment: &ParsedCommitment<EF, MT::Commitment>,
-        mut statement: EqStatement<EF>,
+        parsed_commitment: &MT::Commitment,
+        initial_constraint: Constraint<F, EF>,
+        mut claimed_eval: EF,
     ) -> Result<Point<EF>, VerifierError>
     where
         Challenger: CanObserve<MT::Commitment>,
     {
         let mut constraints = Vec::new();
         let mut round_folding_randomness = Vec::new();
-        let mut claimed_eval = EF::ZERO;
         let mut prev_commitment = parsed_commitment.clone();
 
-        // Combine initial OOD constraints with the public statement.
-        statement.concatenate(&prev_commitment.ood_statement);
-
-        let constraint = Constraint::new(
-            challenger.sample_algebra_element(),
-            statement,
-            SelectStatement::initialize(self.num_variables),
-        );
-        constraint.combine_evals(&mut claimed_eval);
-        constraints.push(constraint);
+        constraints.push(initial_constraint);
 
         // Verify the initial sumcheck.
         let folding_randomness = proof.initial_sumcheck.verify_rounds(
@@ -94,7 +124,7 @@ where
                 challenger,
                 round_params.num_variables,
                 round_params.ood_samples,
-                Some(round_index),
+                round_index,
             );
 
             // Verify STIR in-domain challenges against the previous commitment.
@@ -122,7 +152,7 @@ where
             )?;
             round_folding_randomness.push(folding_randomness);
 
-            prev_commitment = new_commitment;
+            prev_commitment = new_commitment.root;
         }
 
         // Final round: receive the polynomial in the clear.
@@ -167,11 +197,17 @@ where
         );
 
         // Evaluate the constraint polynomial at the folding point.
-        let evaluation_of_weights =
-            VariableOrder::Prefix.eval_constraints_poly(&constraints, &folding_randomness);
+        let evaluation_of_weights = self
+            .variable_order
+            .eval_constraints_poly(&constraints, &folding_randomness);
 
         // Final consistency check: claimed_eval == weight * f(r).
-        let final_value = final_evaluations.eval_ext::<F>(&final_sumcheck_randomness);
+        let final_value = match self.variable_order {
+            VariableOrder::Prefix => final_evaluations.eval_ext::<F>(&final_sumcheck_randomness),
+            VariableOrder::Suffix => {
+                final_evaluations.eval_ext::<F>(&final_sumcheck_randomness.reversed())
+            }
+        };
         if claimed_eval != evaluation_of_weights * final_value {
             return Err(VerifierError::SumcheckFailed {
                 round: self.final_sumcheck_rounds,
@@ -192,7 +228,7 @@ where
         proof: &WhirProof<F, EF, MT>,
         challenger: &mut Challenger,
         params: &RoundConfig<F>,
-        commitment: &ParsedCommitment<EF, MT::Commitment>,
+        commitment: &MT::Commitment,
         folding_randomness: &Point<EF>,
         round_index: usize,
     ) -> Result<SelectStatement<F, EF>, VerifierError> {
@@ -219,7 +255,7 @@ where
             params.folding_factor,
             params.num_queries,
             challenger,
-        )?;
+        );
 
         let dimensions = vec![Dimensions {
             height: params.domain_size >> params.folding_factor,
@@ -227,16 +263,20 @@ where
         }];
         let answers = self.verify_merkle_proof(
             proof,
-            &commitment.root,
+            commitment,
             &stir_challenges_indexes,
             &dimensions,
             round_index,
         )?;
+        let query_randomness = match self.variable_order {
+            VariableOrder::Prefix => folding_randomness.clone(),
+            VariableOrder::Suffix => folding_randomness.reversed(),
+        };
 
         // Evaluate folded polynomial at each queried position.
         let folds: Vec<_> = answers
             .into_iter()
-            .map(|answer| Poly::new(answer).eval_ext::<F>(folding_randomness))
+            .map(|answer| Poly::new(answer).eval_ext::<F>(&query_randomness))
             .collect();
 
         let stir_constraints = stir_challenges_indexes
@@ -260,7 +300,7 @@ where
         dimensions: &[Dimensions],
         round_index: usize,
     ) -> Result<Vec<Vec<EF>>, VerifierError> {
-        let extension_mmcs = ExtensionMmcs::new(self.mmcs.clone());
+        let extension_mmcs = ExtensionMmcs::new((*self.mmcs).clone());
 
         let queries = if round_index == self.n_rounds() {
             &proof.final_queries
@@ -328,10 +368,11 @@ impl<EF, F, MT, Challenger> Deref for WhirVerifier<'_, EF, F, MT, Challenger>
 where
     F: Field,
     EF: ExtensionField<F>,
+    MT: Mmcs<F>,
 {
-    type Target = WhirConfig<EF, F, MT, Challenger>;
+    type Target = WhirConfig<EF, F, Challenger>;
 
     fn deref(&self) -> &Self::Target {
-        self.0
+        self.config
     }
 }
